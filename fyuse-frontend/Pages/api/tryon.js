@@ -1,38 +1,20 @@
-import type { NextApiRequest, NextApiResponse } from "next";
-import jwt from "jsonwebtoken";
+const jwt = require("jsonwebtoken");
 
 const MAX_SEED = 999999;
 const POLL_INTERVAL_MS = 1000;
 const MAX_RETRIES = 12;
 const INITIAL_WAIT_MS = 9000;
 
-interface TryonRequestBody {
-  personImg: string; // Base64 encoded person image
-  garmentImg: string; // Base64 encoded garment image
-  seed: number;
-  randomizeSeed: boolean;
-}
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-interface ApiResponseData {
-  image: string | null; // Base64 encoded result image
-  seed: number;
-  info: string;
-}
-
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-export default async function tryonHandler(
-  req: NextApiRequest,
-  res: NextApiResponse<ApiResponseData | { error: string }>
-) {
+module.exports = async function tryonHandler(req, res) {
   if (req.method !== "POST") {
     res.status(405).json({ error: "Method not allowed" });
     return;
   }
 
   try {
-    const { personImg, garmentImg, seed, randomizeSeed } =
-      req.body as TryonRequestBody;
+    const { personImg, garmentImg, seed, randomizeSeed } = req.body;
 
     if (!personImg || !garmentImg) {
       res.status(400).json({
@@ -124,7 +106,7 @@ export default async function tryonHandler(
     await sleep(INITIAL_WAIT_MS);
 
     // Poll for the result
-    let resultImage: string | null = null;
+    let resultImage = null;
     let info = "";
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       try {
@@ -173,7 +155,7 @@ export default async function tryonHandler(
       seed: usedSeed,
       info,
     });
-  } catch (error: unknown) {
+  } catch (error) {
     console.error("Unexpected error:", error);
     res.status(500).json({
       error: "Unexpected error occurred",
@@ -182,4 +164,4 @@ export default async function tryonHandler(
       info: "Error",
     });
   }
-}
+};
