@@ -1,4 +1,7 @@
-const jwt = require("jsonwebtoken");
+import formidable from "formidable";
+import { promisify } from "util";
+import fs from "fs";
+import jwt from "jsonwebtoken";
 
 const MAX_SEED = 999999;
 const POLL_INTERVAL_MS = 1000;
@@ -7,18 +10,35 @@ const INITIAL_WAIT_MS = 9000;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-module.exports = async function tryonHandler(req, res) {
+// Disable the default body parser for this route
+export const config = {
+  api: {
+    bodyParser: false,
+  },
+};
+
+export default async function tryonHandler(req, res) {
   if (req.method !== "POST") {
     res.status(405).json({ error: "Method not allowed" });
     return;
   }
 
   try {
-    const { personImg, garmentImg, seed, randomizeSeed } = req.body;
+    // Parse the multipart form data
+    const form = formidable({});
+    const [fields, files] = await promisify(form.parse.bind(form))(req);
 
-    if (!personImg || !garmentImg) {
+    // Ensure file values are handled correctly whether they're arrays or not
+    const personImgFile = Array.isArray(files.personImg)
+      ? files.personImg[0]
+      : files.personImg;
+    const garmentImgFile = Array.isArray(files.garmentImg)
+      ? files.garmentImg[0]
+      : files.garmentImg;
+
+    if (!personImgFile || !garmentImgFile) {
       res.status(400).json({
-        error: "Empty image",
+        error: "Missing required images",
         image: null,
         seed: 0,
         info: "Empty image",
@@ -26,21 +46,42 @@ module.exports = async function tryonHandler(req, res) {
       return;
     }
 
+    // Get field values safely (handling possible array values)
+    const randomizeSeed = Array.isArray(fields.randomizeSeed)
+      ? fields.randomizeSeed[0]
+      : fields.randomizeSeed;
+    const seedField = Array.isArray(fields.seed) ? fields.seed[0] : fields.seed;
+
     // Determine the seed
-    let usedSeed = seed;
-    if (randomizeSeed) {
-      usedSeed = Math.floor(Math.random() * MAX_SEED);
-    }
+    const usedSeed =
+      randomizeSeed === "true"
+        ? Math.floor(Math.random() * MAX_SEED)
+        : Number.parseInt(seedField || "0");
+
+    // Read files and convert to base64
+    const personImgBuffer = await fs.promises.readFile(personImgFile.filepath);
+    const garmentImgBuffer = await fs.promises.readFile(
+      garmentImgFile.filepath
+    );
+
+    const personImgBase64 = personImgBuffer.toString("base64");
+    const garmentImgBase64 = garmentImgBuffer.toString("base64");
+
+    // Clean up temporary files
+    await Promise.all([
+      fs.promises.unlink(personImgFile.filepath),
+      fs.promises.unlink(garmentImgFile.filepath),
+    ]);
 
     // Prepare payload for the try-on API
     const payload = {
-      humanImage: personImg,
-      clothImage: garmentImg,
+      humanImage: personImgBase64,
+      clothImage: garmentImgBase64,
       seed: usedSeed,
     };
 
     // Read configuration and credentials from environment variables
-    const baseUrl = process.env.KOLORS_API_URL; // e.g., "https://api.klingai.com/kolors-virtual-try-on/"
+    const baseUrl = process.env.KOLORS_API_URL;
     const accessKeyId = process.env.ACCESS_KEY_ID;
     const accessKeySecret = process.env.ACCESS_KEY_SECRET;
 
@@ -55,21 +96,21 @@ module.exports = async function tryonHandler(req, res) {
       return;
     }
 
-    // Generate JWT token using your AccessKey credentials
+    // Generate JWT token
     const token = jwt.sign({}, accessKeySecret, {
       algorithm: "HS256",
       issuer: accessKeyId,
       expiresIn: "1h",
     });
 
-    // Set up headers with the JWT token using Bearer scheme
+    // Set up headers with the JWT token
     const headers = {
       "Content-Type": "application/json",
       Authorization: `Bearer ${token}`,
     };
 
     // Submit the try-on job
-    const submitUrl = `${baseUrl}Submit`;
+    const submitUrl = `${baseUrl}/Submit`;
     const postResponse = await fetch(submitUrl, {
       method: "POST",
       headers,
@@ -99,44 +140,48 @@ module.exports = async function tryonHandler(req, res) {
       return;
     }
 
-    // Retrieve the task identifier
+    // Get task ID and wait for initial processing
     const taskId = postResult.result;
-
-    // Wait for the model to start processing
     await sleep(INITIAL_WAIT_MS);
 
     // Poll for the result
     let resultImage = null;
     let info = "";
+
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       try {
-        const queryUrl = `${baseUrl}Query?taskId=${taskId}`;
+        const queryUrl = `${baseUrl}/Query?taskId=${taskId}`;
         const queryResponse = await fetch(queryUrl, {
           method: "GET",
           headers,
         });
-        if (queryResponse.ok) {
-          const queryData = await queryResponse.json();
-          const queryResult = queryData.result;
-          if (queryResult.status === "success") {
-            // Expecting queryResult.result to be a Base64 encoded image
-            resultImage = queryResult.result;
-            info = "Success";
-            break;
-          }
-          if (queryResult.status === "error") {
-            info = "Error";
-            break;
-          }
-        } else {
+
+        if (!queryResponse.ok) {
           info = "URL error, please contact the admin";
           break;
         }
+
+        const queryData = await queryResponse.json();
+        const queryResult = queryData.result;
+
+        if (queryResult.status === "success") {
+          resultImage = queryResult.result;
+          info = "Success";
+          break;
+        }
+
+        if (queryResult.status === "error") {
+          info = "Error processing images";
+          break;
+        }
+
+        // If still processing, wait before next attempt
+        await sleep(POLL_INTERVAL_MS);
       } catch (pollError) {
         console.error("Error during polling:", pollError);
         info = "Http Timeout, please try again later";
+        break;
       }
-      await sleep(POLL_INTERVAL_MS);
     }
 
     if (info !== "Success" || !resultImage) {
@@ -149,7 +194,7 @@ module.exports = async function tryonHandler(req, res) {
       return;
     }
 
-    // Return the result image (base64), used seed, and info message
+    // Return successful result
     res.status(200).json({
       image: resultImage,
       seed: usedSeed,
@@ -164,4 +209,4 @@ module.exports = async function tryonHandler(req, res) {
       info: "Error",
     });
   }
-};
+}

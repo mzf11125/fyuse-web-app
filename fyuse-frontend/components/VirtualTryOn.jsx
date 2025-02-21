@@ -1,4 +1,3 @@
-// components/VirtualTryOn.jsx
 "use client";
 
 import { useState, useCallback } from "react";
@@ -71,6 +70,7 @@ export default function VirtualTryOn() {
     setInfo("");
 
     try {
+      // Create form data object
       const formData = new FormData();
       formData.append("personImg", dataURLtoFile(personImage, "person.jpg"));
       formData.append(
@@ -80,20 +80,18 @@ export default function VirtualTryOn() {
       formData.append("seed", "0");
       formData.append("randomizeSeed", "true");
 
-      const response = await fetch("/api/tryon.js", {
+      const response = await fetch("/api/tryon", {
+        // Updated endpoint
         method: "POST",
-        body: formData,
-        // headers: {
-        //   "Content-Type": "multipart/form-data",
-        // },
+        body: formData, // Send FormData directly
       });
 
-      const text = await response.text();
       if (!response.ok) {
+        const text = await response.text();
         throw new Error(text || "Failed to process images");
       }
-      const data = JSON.parse(text);
 
+      const data = await response.json();
       setResultImage(data.image);
       setSeedUsed(data.seed);
       setInfo(data.info);
