@@ -10,39 +10,27 @@ import {
   CardFooter,
 } from "./ui/card.jsx";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./ui/tabs.jsx";
-import { ImagePlus, Shirt, Upload, Loader2 } from "lucide-react";
-
-// Convert data URL to File object
-const dataURLtoFile = (dataurl, filename) => {
-  const arr = dataurl.split(",");
-  const mime = arr[0].match(/:(.*?);/)[1];
-  const bstr = atob(arr[1]);
-  let n = bstr.length;
-  const u8arr = new Uint8Array(n);
-  while (n--) {
-    u8arr[n] = bstr.charCodeAt(n);
-  }
-  return new File([u8arr], filename, { type: mime });
-};
+import { ImagePlus, Shirt, Loader2 } from "lucide-react";
 
 export default function VirtualTryOn() {
-  const [personImage, setPersonImage] = useState(null);
-  const [clothingImage, setClothingImage] = useState(null);
+  // Store file objects and preview URLs separately
+  const [personFile, setPersonFile] = useState(null);
+  const [personPreview, setPersonPreview] = useState(null);
+  const [clothingFile, setClothingFile] = useState(null);
+  const [clothingPreview, setClothingPreview] = useState(null);
   const [resultImage, setResultImage] = useState(null);
   const [loading, setLoading] = useState(false);
   const [activeTab, setActiveTab] = useState("upload");
   const [info, setInfo] = useState("");
   const [seedUsed, setSeedUsed] = useState(0);
 
-  const handleDrop = useCallback((e, setImage) => {
+  const handleDrop = useCallback((e, setFile, setPreview) => {
     e.preventDefault();
     e.stopPropagation();
-
     const file = e.dataTransfer?.files[0];
     if (file?.type?.startsWith("image/")) {
-      const reader = new FileReader();
-      reader.onload = (event) => setImage(event.target.result);
-      reader.readAsDataURL(file);
+      setFile(file);
+      setPreview(URL.createObjectURL(file));
     }
   }, []);
 
@@ -51,17 +39,16 @@ export default function VirtualTryOn() {
     e.stopPropagation();
   }, []);
 
-  const handleFileSelect = useCallback((e, setImage) => {
+  const handleFileSelect = useCallback((e, setFile, setPreview) => {
     const file = e.target.files[0];
     if (file?.type?.startsWith("image/")) {
-      const reader = new FileReader();
-      reader.onload = (event) => setImage(event.target.result);
-      reader.readAsDataURL(file);
+      setFile(file);
+      setPreview(URL.createObjectURL(file));
     }
   }, []);
 
   const processImages = async () => {
-    if (!personImage || !clothingImage) {
+    if (!personFile || !clothingFile) {
       setInfo("Please upload both images first");
       return;
     }
@@ -70,20 +57,16 @@ export default function VirtualTryOn() {
     setInfo("");
 
     try {
-      // Create form data object
+      // Create a FormData object and append the files
       const formData = new FormData();
-      formData.append("personImg", dataURLtoFile(personImage, "person.jpg"));
-      formData.append(
-        "garmentImg",
-        dataURLtoFile(clothingImage, "garment.jpg")
-      );
+      formData.append("personImg", personFile);
+      formData.append("garmentImg", clothingFile);
       formData.append("seed", "0");
       formData.append("randomizeSeed", "true");
 
       const response = await fetch("/api/tryon", {
-        // Updated endpoint
         method: "POST",
-        body: formData, // Send FormData directly
+        body: formData,
       });
 
       if (!response.ok) {
@@ -104,7 +87,14 @@ export default function VirtualTryOn() {
     }
   };
 
-  const ImageUploadCard = ({ title, image, setImage, icon: Icon, id }) => (
+  const ImageUploadCard = ({
+    title,
+    preview,
+    setFile,
+    setPreview,
+    icon: Icon,
+    id,
+  }) => (
     <Card>
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
@@ -115,7 +105,7 @@ export default function VirtualTryOn() {
       <CardContent>
         <div
           className="relative border-2 border-dashed rounded-lg p-6 flex flex-col items-center justify-center h-64 cursor-pointer hover:border-primary transition-colors"
-          onDrop={(e) => handleDrop(e, setImage)}
+          onDrop={(e) => handleDrop(e, setFile, setPreview)}
           onDragOver={handleDragOver}
           onClick={() => document.getElementById(id).click()}
           onKeyDown={(e) => {
@@ -124,9 +114,9 @@ export default function VirtualTryOn() {
             }
           }}
         >
-          {image ? (
+          {preview ? (
             <img
-              src={image}
+              src={preview}
               alt={`${title} preview`}
               className="max-h-full max-w-full object-contain rounded-md"
             />
@@ -141,7 +131,7 @@ export default function VirtualTryOn() {
             id={id}
             className="hidden"
             accept="image/*"
-            onChange={(e) => handleFileSelect(e, setImage)}
+            onChange={(e) => handleFileSelect(e, setFile, setPreview)}
           />
         </div>
       </CardContent>
@@ -167,15 +157,17 @@ export default function VirtualTryOn() {
         >
           <ImageUploadCard
             title="Your Photo"
-            image={personImage}
-            setImage={setPersonImage}
+            preview={personPreview}
+            setFile={setPersonFile}
+            setPreview={setPersonPreview}
             icon={ImagePlus}
             id="personImage"
           />
           <ImageUploadCard
             title="Clothing Item"
-            image={clothingImage}
-            setImage={setClothingImage}
+            preview={clothingPreview}
+            setFile={setClothingFile}
+            setPreview={setClothingPreview}
             icon={Shirt}
             id="clothingImage"
           />
@@ -221,7 +213,7 @@ export default function VirtualTryOn() {
       <div className="mt-8 text-center">
         <Button
           onClick={processImages}
-          disabled={!personImage || !clothingImage || loading}
+          disabled={!personFile || !clothingFile || loading}
           className="min-w-[200px]"
         >
           {loading ? (

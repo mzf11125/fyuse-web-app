@@ -1,6 +1,5 @@
 import formidable from "formidable";
-import { promisify } from "util";
-import fs from "fs";
+import fs from "node:fs";
 import jwt from "jsonwebtoken";
 
 const MAX_SEED = 999999;
@@ -24,9 +23,25 @@ export default async function tryonHandler(req, res) {
   }
 
   try {
-    // Parse the multipart form data
-    const form = formidable({});
-    const [fields, files] = await promisify(form.parse.bind(form))(req);
+    // Create formidable instance with multiples enabled for consistent file handling
+    const form = formidable({ multiples: true, keepExtensions: true });
+    const { fields, files } = await form.parse(req);
+
+    // Log parsed data (remove or comment out in production)
+    console.log("Parsed fields:", fields);
+    console.log("Parsed files:", files);
+
+    // More detailed file validation
+    if (!files || !files.personImg || !files.garmentImg) {
+      console.error('File validation failed. Files received:', files);
+      res.status(400).json({
+        error: "Missing required image files",
+        image: null,
+        seed: 0,
+        info: files ? `Received files: ${Object.keys(files).join(', ')}` : 'No files received',
+      });
+      return;
+    }
 
     // Ensure file values are handled correctly whether they're arrays or not
     const personImgFile = Array.isArray(files.personImg)
@@ -52,7 +67,7 @@ export default async function tryonHandler(req, res) {
       : fields.randomizeSeed;
     const seedField = Array.isArray(fields.seed) ? fields.seed[0] : fields.seed;
 
-    // Determine the seed
+    // Determine the seed value
     const usedSeed =
       randomizeSeed === "true"
         ? Math.floor(Math.random() * MAX_SEED)
@@ -63,7 +78,6 @@ export default async function tryonHandler(req, res) {
     const garmentImgBuffer = await fs.promises.readFile(
       garmentImgFile.filepath
     );
-
     const personImgBase64 = personImgBuffer.toString("base64");
     const garmentImgBase64 = garmentImgBuffer.toString("base64");
 
@@ -80,7 +94,7 @@ export default async function tryonHandler(req, res) {
       seed: usedSeed,
     };
 
-    // Read configuration and credentials from environment variables
+    // Retrieve configuration from environment variables
     const baseUrl = process.env.KOLORS_API_URL;
     const accessKeyId = process.env.ACCESS_KEY_ID;
     const accessKeySecret = process.env.ACCESS_KEY_SECRET;
@@ -96,21 +110,25 @@ export default async function tryonHandler(req, res) {
       return;
     }
 
-    // Generate JWT token
+    // Generate JWT token for the try-on API
     const token = jwt.sign({}, accessKeySecret, {
       algorithm: "HS256",
       issuer: accessKeyId,
       expiresIn: "1h",
     });
 
-    // Set up headers with the JWT token
+    // Set up headers for the external API call
     const headers = {
       "Content-Type": "application/json",
       Authorization: `Bearer ${token}`,
     };
 
-    // Submit the try-on job
-    const submitUrl = `${baseUrl}/Submit`;
+    // Remove any trailing slash from the base URL to avoid double slashes
+    const trimmedBaseUrl = baseUrl.endsWith("/")
+      ? baseUrl.slice(0, -1)
+      : baseUrl;
+    const submitUrl = `${trimmedBaseUrl}/Submit`;
+
     const postResponse = await fetch(submitUrl, {
       method: "POST",
       headers,
@@ -150,7 +168,7 @@ export default async function tryonHandler(req, res) {
 
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       try {
-        const queryUrl = `${baseUrl}/Query?taskId=${taskId}`;
+        const queryUrl = `${trimmedBaseUrl}/Query?taskId=${taskId}`;
         const queryResponse = await fetch(queryUrl, {
           method: "GET",
           headers,
@@ -175,7 +193,7 @@ export default async function tryonHandler(req, res) {
           break;
         }
 
-        // If still processing, wait before next attempt
+        // Wait before next polling attempt
         await sleep(POLL_INTERVAL_MS);
       } catch (pollError) {
         console.error("Error during polling:", pollError);
@@ -194,7 +212,7 @@ export default async function tryonHandler(req, res) {
       return;
     }
 
-    // Return successful result
+    // Return the successful result
     res.status(200).json({
       image: resultImage,
       seed: usedSeed,
