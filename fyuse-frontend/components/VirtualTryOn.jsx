@@ -59,8 +59,13 @@ export default function VirtualTryOn() {
     try {
       // Create a FormData object and append the files
       const formData = new FormData();
-      formData.append("personImg", personFile);
-      formData.append("garmentImg", clothingFile);
+      // Append files with filename and explicit MIME type
+      formData.append("personImg", personFile, personFile.name);
+      formData.append("garmentImg", clothingFile, clothingFile.name);
+      // Add explicit content-type header
+      const headers = {
+        "Content-Type": "multipart/form-data",
+      };
       formData.append("seed", "0");
       formData.append("randomizeSeed", "true");
 

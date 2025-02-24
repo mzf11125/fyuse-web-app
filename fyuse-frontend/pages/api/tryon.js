@@ -1,6 +1,7 @@
 import formidable from "formidable";
 import fs from "node:fs";
 import jwt from "jsonwebtoken";
+import sharp from "sharp";
 
 const MAX_SEED = 999999;
 const POLL_INTERVAL_MS = 1000;
@@ -9,12 +10,41 @@ const INITIAL_WAIT_MS = 9000;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Disable the default body parser for this route
 export const config = {
   api: {
     bodyParser: false,
   },
 };
+
+// Generate JWT token using access credentials
+function generateToken(accessKeyId, accessKeySecret) {
+  const payload = {
+    access_key_id: accessKeyId,
+    // Add timestamp to ensure token freshness
+    iat: Math.floor(Date.now() / 1000),
+  };
+
+  return jwt.sign(payload, accessKeySecret);
+}
+
+async function processImage(buffer) {
+  try {
+    const processedBuffer = await sharp(buffer)
+      .raw()
+      .ensureAlpha()
+      .toColorspace("srgb")
+      .jpeg({
+        quality: 100,
+        chromaSubsampling: "4:4:4",
+      })
+      .toBuffer();
+
+    return processedBuffer;
+  } catch (error) {
+    console.error("Error processing image:", error);
+    throw error;
+  }
+}
 
 export default async function tryonHandler(req, res) {
   if (req.method !== "POST") {
@@ -22,38 +52,22 @@ export default async function tryonHandler(req, res) {
     return;
   }
 
+  const startTime = Date.now();
+  console.log("Starting processing at:", startTime);
+
   try {
-    // Create formidable instance with multiples enabled for consistent file handling
-    const form = formidable({ multiples: true, keepExtensions: true });
-    const { fields, files } = await form.parse(req);
+    const form = formidable({
+      multiples: true,
+      keepExtensions: true,
+      maxFileSize: 100 * 1024 * 1024,
+      maxFieldsSize: 100 * 1024 * 1024,
+    });
 
-    // Log parsed data (remove or comment out in production)
-    console.log("Parsed fields:", fields);
-    console.log("Parsed files:", files);
+    let [fields, files] = await form.parse(req);
 
-    // More detailed file validation
     if (!files || !files.personImg || !files.garmentImg) {
-      console.error('File validation failed. Files received:', files);
       res.status(400).json({
-        error: "Missing required image files",
-        image: null,
-        seed: 0,
-        info: files ? `Received files: ${Object.keys(files).join(', ')}` : 'No files received',
-      });
-      return;
-    }
-
-    // Ensure file values are handled correctly whether they're arrays or not
-    const personImgFile = Array.isArray(files.personImg)
-      ? files.personImg[0]
-      : files.personImg;
-    const garmentImgFile = Array.isArray(files.garmentImg)
-      ? files.garmentImg[0]
-      : files.garmentImg;
-
-    if (!personImgFile || !garmentImgFile) {
-      res.status(400).json({
-        error: "Missing required images",
+        error: "Empty image",
         image: null,
         seed: 0,
         info: "Empty image",
@@ -61,170 +75,180 @@ export default async function tryonHandler(req, res) {
       return;
     }
 
-    // Get field values safely (handling possible array values)
+    const personImgFile = Array.isArray(files.personImg)
+      ? files.personImg[0]
+      : files.personImg;
+    const garmentImgFile = Array.isArray(files.garmentImg)
+      ? files.garmentImg[0]
+      : files.garmentImg;
+
     const randomizeSeed = Array.isArray(fields.randomizeSeed)
       ? fields.randomizeSeed[0]
       : fields.randomizeSeed;
     const seedField = Array.isArray(fields.seed) ? fields.seed[0] : fields.seed;
-
-    // Determine the seed value
     const usedSeed =
       randomizeSeed === "true"
         ? Math.floor(Math.random() * MAX_SEED)
         : Number.parseInt(seedField || "0");
 
-    // Read files and convert to base64
-    const personImgBuffer = await fs.promises.readFile(personImgFile.filepath);
-    const garmentImgBuffer = await fs.promises.readFile(
-      garmentImgFile.filepath
-    );
-    const personImgBase64 = personImgBuffer.toString("base64");
-    const garmentImgBase64 = garmentImgBuffer.toString("base64");
+    try {
+      const personImgBuffer = await fs.promises.readFile(
+        personImgFile.filepath
+      );
+      const garmentImgBuffer = await fs.promises.readFile(
+        garmentImgFile.filepath
+      );
 
-    // Clean up temporary files
-    await Promise.all([
-      fs.promises.unlink(personImgFile.filepath),
-      fs.promises.unlink(garmentImgFile.filepath),
-    ]);
+      const processedPersonImg = await processImage(personImgBuffer);
+      const processedGarmentImg = await processImage(garmentImgBuffer);
 
-    // Prepare payload for the try-on API
-    const payload = {
-      humanImage: personImgBase64,
-      clothImage: garmentImgBase64,
-      seed: usedSeed,
-    };
+      const personImgBase64 = processedPersonImg.toString("base64");
+      const garmentImgBase64 = processedGarmentImg.toString("base64");
 
-    // Retrieve configuration from environment variables
-    const baseUrl = process.env.KOLORS_API_URL;
-    const accessKeyId = process.env.ACCESS_KEY_ID;
-    const accessKeySecret = process.env.ACCESS_KEY_SECRET;
+      await Promise.all([
+        fs.promises.unlink(personImgFile.filepath),
+        fs.promises.unlink(garmentImgFile.filepath),
+      ]);
 
-    if (!baseUrl || !accessKeyId || !accessKeySecret) {
-      res.status(500).json({
-        error:
-          "Missing API configuration. Please set KOLORS_API_URL, ACCESS_KEY_ID, and ACCESS_KEY_SECRET in your environment.",
-        image: null,
-        seed: usedSeed,
-        info: "Configuration error",
-      });
-      return;
-    }
+      const baseUrl = process.env.KOLORS_API_URL;
+      const accessKeyId = process.env.ACCESS_KEY_ID;
+      const accessKeySecret = process.env.ACCESS_KEY_SECRET;
 
-    // Generate JWT token for the try-on API
-    const token = jwt.sign({}, accessKeySecret, {
-      algorithm: "HS256",
-      issuer: accessKeyId,
-      expiresIn: "1h",
-    });
-
-    // Set up headers for the external API call
-    const headers = {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-    };
-
-    // Remove any trailing slash from the base URL to avoid double slashes
-    const trimmedBaseUrl = baseUrl.endsWith("/")
-      ? baseUrl.slice(0, -1)
-      : baseUrl;
-    const submitUrl = `${trimmedBaseUrl}/Submit`;
-
-    const postResponse = await fetch(submitUrl, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload),
-    });
-
-    if (!postResponse.ok) {
-      const errText = await postResponse.text();
-      res.status(postResponse.status).json({
-        error: `Error during job submission: ${errText}`,
-        image: null,
-        seed: usedSeed,
-        info: "Submission error",
-      });
-      return;
-    }
-
-    const postData = await postResponse.json();
-    const postResult = postData.result;
-    if (postResult.status !== "success") {
-      res.status(500).json({
-        error: "Try-on API returned an error during submission",
-        image: null,
-        seed: usedSeed,
-        info: postResult.status,
-      });
-      return;
-    }
-
-    // Get task ID and wait for initial processing
-    const taskId = postResult.result;
-    await sleep(INITIAL_WAIT_MS);
-
-    // Poll for the result
-    let resultImage = null;
-    let info = "";
-
-    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-      try {
-        const queryUrl = `${trimmedBaseUrl}/Query?taskId=${taskId}`;
-        const queryResponse = await fetch(queryUrl, {
-          method: "GET",
-          headers,
+      if (!baseUrl || !accessKeyId || !accessKeySecret) {
+        res.status(500).json({
+          error: "Missing API configuration",
+          image: null,
+          seed: usedSeed,
+          info: "Configuration error",
         });
-
-        if (!queryResponse.ok) {
-          info = "URL error, please contact the admin";
-          break;
-        }
-
-        const queryData = await queryResponse.json();
-        const queryResult = queryData.result;
-
-        if (queryResult.status === "success") {
-          resultImage = queryResult.result;
-          info = "Success";
-          break;
-        }
-
-        if (queryResult.status === "error") {
-          info = "Error processing images";
-          break;
-        }
-
-        // Wait before next polling attempt
-        await sleep(POLL_INTERVAL_MS);
-      } catch (pollError) {
-        console.error("Error during polling:", pollError);
-        info = "Http Timeout, please try again later";
-        break;
+        return;
       }
-    }
 
-    if (info !== "Success" || !resultImage) {
-      res.status(500).json({
-        error: info,
-        image: null,
+      // Generate JWT token using credentials
+      const token = generateToken(accessKeyId, accessKeySecret);
+
+      const headers = {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      };
+
+      const payload = {
+        clothImage: garmentImgBase64,
+        humanImage: personImgBase64,
+        seed: usedSeed,
+      };
+
+      const submitUrl = `${baseUrl}/Submit`;
+      console.log("Post start time:", Date.now() - startTime);
+
+      const postResponse = await fetch(submitUrl, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+        timeout: 50000,
+      });
+
+      console.log("Post end time:", Date.now() - startTime);
+
+      if (!postResponse.ok) {
+        throw new Error(
+          `API error: ${postResponse.status} ${postResponse.statusText}`
+        );
+      }
+
+      const postData = await postResponse.json();
+      const postResult = postData.result;
+
+      if (postResult.status !== "success") {
+        throw new Error(postResult.message || "API request failed");
+      }
+
+      const taskId = postResult.result;
+      await sleep(INITIAL_WAIT_MS);
+
+      let resultImage = null;
+      let info = "";
+      let errLog = "";
+
+      console.log("Get start time:", Date.now() - startTime);
+
+      for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        try {
+          const queryUrl = `${baseUrl}/Query?taskId=${taskId}`;
+          const queryResponse = await fetch(queryUrl, {
+            method: "GET",
+            headers,
+            timeout: 20000,
+          });
+
+          if (!queryResponse.ok) {
+            errLog = `API error: ${queryResponse.status} ${queryResponse.statusText}`;
+            info = "API error occurred";
+            break;
+          }
+
+          const queryData = await queryResponse.json();
+          const queryResult = queryData.result;
+
+          if (queryResult.status === "success") {
+            resultImage = queryResult.result;
+            info = "Success";
+            break;
+          }
+          if (queryResult.status === "error") {
+            errLog = queryResult.message || "Status is Error";
+            info = "API processing error";
+            break;
+          }
+
+          await sleep(POLL_INTERVAL_MS);
+        } catch (error) {
+          console.error("Poll error:", error);
+          errLog = error.message;
+          info = "Request timeout, please try again";
+        }
+      }
+
+      console.log("Get end time:", Date.now() - startTime);
+      console.log("Total time used:", Date.now() - startTime);
+
+      if (info === "") {
+        errLog = `No result after ${MAX_RETRIES} retries`;
+        info = "Request timeout, please try again";
+      }
+
+      if (info !== "Success") {
+        console.error("Error Log:", errLog);
+        res.status(500).json({
+          error: errLog,
+          image: null,
+          seed: usedSeed,
+          info,
+        });
+        return;
+      }
+
+      res.status(200).json({
+        image: resultImage,
         seed: usedSeed,
         info,
       });
-      return;
+    } catch (processingError) {
+      console.error("Processing error:", processingError);
+      res.status(500).json({
+        error: processingError.message,
+        image: null,
+        seed: usedSeed,
+        info: "Processing error occurred",
+      });
     }
-
-    // Return the successful result
-    res.status(200).json({
-      image: resultImage,
-      seed: usedSeed,
-      info,
-    });
   } catch (error) {
     console.error("Unexpected error:", error);
     res.status(500).json({
-      error: "Unexpected error occurred",
+      error: error.message,
       image: null,
       seed: 0,
-      info: "Error",
+      info: "Unexpected error occurred",
     });
   }
 }
