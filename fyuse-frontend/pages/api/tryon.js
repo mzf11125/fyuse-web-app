@@ -1,12 +1,12 @@
 import formidable from "formidable";
 import fs from "node:fs";
 import jwt from "jsonwebtoken";
-import sharp from "sharp";
+import path from "node:path";
+import { v4 as uuidv4 } from "uuid";
 
-const MAX_SEED = 999999;
-const POLL_INTERVAL_MS = 1000;
-const MAX_RETRIES = 12;
-const INITIAL_WAIT_MS = 9000;
+// Constants for polling
+const POLL_INTERVAL_MS = 3000; // 3 seconds between checks
+const MAX_WAIT_TIME_MS = 120000; // 2 minutes max wait
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -16,33 +16,80 @@ export const config = {
   },
 };
 
-// Generate JWT token using access credentials
+// Generate JWT token using access credentials (matching Kling API requirements)
 function generateToken(accessKeyId, accessKeySecret) {
-  const payload = {
-    access_key_id: accessKeyId,
-    // Add timestamp to ensure token freshness
-    iat: Math.floor(Date.now() / 1000),
+  const headers = {
+    alg: "HS256",
+    typ: "JWT",
   };
 
-  return jwt.sign(payload, accessKeySecret);
+  const payload = {
+    iss: accessKeyId,
+    exp: Math.floor(Date.now() / 1000) + 1800, // Current time + 30min
+    nbf: Math.floor(Date.now() / 1000) - 5, // Current time - 5s
+  };
+
+  return jwt.sign(payload, accessKeySecret, { header: headers });
 }
 
-async function processImage(buffer) {
-  try {
-    const processedBuffer = await sharp(buffer)
-      .raw()
-      .ensureAlpha()
-      .toColorspace("srgb")
-      .jpeg({
-        quality: 100,
-        chromaSubsampling: "4:4:4",
-      })
-      .toBuffer();
+// Function to save image to public directory and return URL
+async function saveImageAndGetUrl(buffer, filename, req) {
+  // Define public directory path - adjust as needed for your Next.js setup
+  const publicDir = path.join(process.cwd(), "public", "uploads");
 
-    return processedBuffer;
+  // Create directory if it doesn't exist
+  if (!fs.existsSync(publicDir)) {
+    fs.mkdirSync(publicDir, { recursive: true });
+  }
+
+  // Generate unique filename
+  const uniqueFilename = `${uuidv4()}-${filename}`;
+  const filePath = path.join(publicDir, uniqueFilename);
+
+  // Write file
+  await fs.promises.writeFile(filePath, buffer);
+
+  // Get base URL from request (works in both development and production)
+  const protocol = req.headers["x-forwarded-proto"] || "http";
+  const host = req.headers.host || "localhost:3000";
+  const baseUrl = `${protocol}://${host}`;
+
+  // Return public URL
+  return `${baseUrl}/uploads/${uniqueFilename}`;
+}
+
+// Function to validate image URL
+async function validateImageUrl(url) {
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
+
+    const response = await fetch(url, {
+      method: "HEAD",
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+
+    const contentType = response.headers.get("content-type");
+
+    if (!contentType?.startsWith("image/")) {
+      throw new Error(
+        `URL does not point to an image (content-type: ${contentType})`
+      );
+    }
+    if (!response.ok) {
+      throw new Error(
+        `URL is not accessible (status code: ${response.status})`
+      );
+    }
+
+    return true;
   } catch (error) {
-    console.error("Error processing image:", error);
-    throw error;
+    if (error.name === "AbortError") {
+      throw new Error("Image URL validation timed out");
+    }
+    throw new Error(`Error accessing URL: ${error.message || "Unknown error"}`);
   }
 }
 
@@ -63,14 +110,13 @@ export default async function tryonHandler(req, res) {
       maxFieldsSize: 100 * 1024 * 1024,
     });
 
-    let [fields, files] = await form.parse(req);
+    const [fields, files] = await form.parse(req);
 
     if (!files || !files.personImg || !files.garmentImg) {
       res.status(400).json({
         error: "Empty image",
-        image: null,
-        seed: 0,
-        info: "Empty image",
+        status: "error",
+        message: "Both person and garment images are required",
       });
       return;
     }
@@ -82,16 +128,8 @@ export default async function tryonHandler(req, res) {
       ? files.garmentImg[0]
       : files.garmentImg;
 
-    const randomizeSeed = Array.isArray(fields.randomizeSeed)
-      ? fields.randomizeSeed[0]
-      : fields.randomizeSeed;
-    const seedField = Array.isArray(fields.seed) ? fields.seed[0] : fields.seed;
-    const usedSeed =
-      randomizeSeed === "true"
-        ? Math.floor(Math.random() * MAX_SEED)
-        : Number.parseInt(seedField || "0");
-
     try {
+      // Read the image files into buffers
       const personImgBuffer = await fs.promises.readFile(
         personImgFile.filepath
       );
@@ -99,30 +137,54 @@ export default async function tryonHandler(req, res) {
         garmentImgFile.filepath
       );
 
-      const processedPersonImg = await processImage(personImgBuffer);
-      const processedGarmentImg = await processImage(garmentImgBuffer);
+      // Save images and get public URLs
+      const humanImageUrl = await saveImageAndGetUrl(
+        personImgBuffer,
+        personImgFile.originalFilename || "person.jpg",
+        req
+      );
 
-      const personImgBase64 = processedPersonImg.toString("base64");
-      const garmentImgBase64 = processedGarmentImg.toString("base64");
+      const clothImageUrl = await saveImageAndGetUrl(
+        garmentImgBuffer,
+        garmentImgFile.originalFilename || "garment.jpg",
+        req
+      );
 
+      console.log("Human Image URL:", humanImageUrl);
+      console.log("Cloth Image URL:", clothImageUrl);
+
+      // Validate image URLs
+      try {
+        await Promise.all([
+          validateImageUrl(humanImageUrl),
+          validateImageUrl(clothImageUrl),
+        ]);
+        console.log("Image URLs validated successfully");
+      } catch (validationError) {
+        throw new Error(`Image validation failed: ${validationError.message}`);
+      }
+
+      // Clean up temporary files
       await Promise.all([
         fs.promises.unlink(personImgFile.filepath),
         fs.promises.unlink(garmentImgFile.filepath),
       ]);
 
-      const baseUrl = process.env.KOLORS_API_URL;
+      // Get API credentials from environment
+      const API_BASE_URL = process.env.KOLORS_API_URL;
       const accessKeyId = process.env.ACCESS_KEY_ID;
       const accessKeySecret = process.env.ACCESS_KEY_SECRET;
 
-      if (!baseUrl || !accessKeyId || !accessKeySecret) {
+      if (!API_BASE_URL || !accessKeyId || !accessKeySecret) {
         res.status(500).json({
           error: "Missing API configuration",
-          image: null,
-          seed: usedSeed,
-          info: "Configuration error",
+          status: "error",
+          message: "API credentials not configured",
         });
         return;
       }
+
+      console.log("Using API URL:", API_BASE_URL);
 
       // Generate JWT token using credentials
       const token = generateToken(accessKeyId, accessKeySecret);
@@ -132,123 +194,158 @@ export default async function tryonHandler(req, res) {
         Authorization: `Bearer ${token}`,
       };
 
+      // Create payload matching Kling API format
       const payload = {
-        clothImage: garmentImgBase64,
-        humanImage: personImgBase64,
-        seed: usedSeed,
+        model_name: "kolors-virtual-try-on-v1",
+        human_image: humanImageUrl,
+        cloth_image: clothImageUrl,
       };
 
-      const submitUrl = `${baseUrl}/Submit`;
-      console.log("Post start time:", Date.now() - startTime);
+      console.log("Creating task with payload:", JSON.stringify(payload));
+      console.log("Task creation start time:", Date.now() - startTime);
 
-      const postResponse = await fetch(submitUrl, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(payload),
-        timeout: 50000,
-      });
+      // Create task with timeout handling
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
 
-      console.log("Post end time:", Date.now() - startTime);
+      try {
+        const postResponse = await fetch(API_BASE_URL, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        });
 
-      if (!postResponse.ok) {
-        throw new Error(
-          `API error: ${postResponse.status} ${postResponse.statusText}`
-        );
-      }
+        clearTimeout(timeoutId);
+        console.log("Task creation response status:", postResponse.status);
+        console.log("Task creation end time:", Date.now() - startTime);
 
-      const postData = await postResponse.json();
-      const postResult = postData.result;
+        if (!postResponse.ok) {
+          const errorText = await postResponse.text();
+          console.error("API error response:", errorText);
+          throw new Error(
+            `API error: ${postResponse.status} ${postResponse.statusText}`
+          );
+        }
 
-      if (postResult.status !== "success") {
-        throw new Error(postResult.message || "API request failed");
-      }
+        const postData = await postResponse.json();
+        console.log("Task creation response:", JSON.stringify(postData));
 
-      const taskId = postResult.result;
-      await sleep(INITIAL_WAIT_MS);
+        if (postData.code !== 0) {
+          throw new Error(`API Error: ${postData.message}`);
+        }
 
-      let resultImage = null;
-      let info = "";
-      let errLog = "";
+        const taskId = postData.data.task_id;
+        console.log("Task created with ID:", taskId);
 
-      console.log("Get start time:", Date.now() - startTime);
+        // Wait for task completion
+        const startWaitTime = Date.now();
+        let resultImageUrl = null;
 
-      for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-        try {
-          const queryUrl = `${baseUrl}/Query?taskId=${taskId}`;
-          const queryResponse = await fetch(queryUrl, {
-            method: "GET",
-            headers,
-            timeout: 20000,
+        while (Date.now() - startWaitTime < MAX_WAIT_TIME_MS) {
+          try {
+            console.log(
+              `Polling task status... (${Math.round(
+                (Date.now() - startWaitTime) / 1000
+              )}s elapsed)`
+            );
+
+            const queryController = new AbortController();
+            const queryTimeoutId = setTimeout(
+              () => queryController.abort(),
+              10000
+            );
+
+            const queryResponse = await fetch(`${API_BASE_URL}/${taskId}`, {
+              headers,
+              signal: queryController.signal,
+            });
+
+            clearTimeout(queryTimeoutId);
+
+            if (!queryResponse.ok) {
+              throw new Error(
+                `API request failed: ${queryResponse.status} ${queryResponse.statusText}`
+              );
+            }
+
+            const queryData = await queryResponse.json();
+            console.log("Poll response:", JSON.stringify(queryData));
+
+            if (queryData.code !== 0) {
+              throw new Error(`API Error: ${queryData.message}`);
+            }
+
+            const status = queryData.data.task_status;
+
+            if (status === "succeed") {
+              // Extract result image URL
+              resultImageUrl = queryData.data.task_result?.images[0]?.url;
+              console.log(
+                "Task completed successfully with result:",
+                resultImageUrl
+              );
+              break;
+            }
+            if (status === "failed") {
+              throw new Error(
+                `Task failed: ${
+                  queryData.data.task_status_msg || "Unknown error"
+                }`
+              );
+            }
+
+            // If still processing, wait before next check
+            await sleep(POLL_INTERVAL_MS);
+          } catch (pollError) {
+            if (pollError.name === "AbortError") {
+              console.log("Poll request timed out, trying again...");
+              continue;
+            }
+            throw pollError;
+          }
+        }
+
+        console.log("Polling end time:", Date.now() - startTime);
+        console.log("Total time used:", Date.now() - startTime);
+
+        if (!resultImageUrl) {
+          throw new Error(
+            `Task ${taskId} timed out after ${MAX_WAIT_TIME_MS / 1000} seconds`
+          );
+        }
+
+        // Return success response with image URL
+        res.status(200).json({
+          status: "success",
+          task_id: taskId,
+          generated_image_url: resultImageUrl,
+        });
+      } catch (fetchError) {
+        if (fetchError.name === "AbortError") {
+          res.status(504).json({
+            status: "error",
+            error: "API request timed out",
+            message: "Request timeout, please try again",
           });
-
-          if (!queryResponse.ok) {
-            errLog = `API error: ${queryResponse.status} ${queryResponse.statusText}`;
-            info = "API error occurred";
-            break;
-          }
-
-          const queryData = await queryResponse.json();
-          const queryResult = queryData.result;
-
-          if (queryResult.status === "success") {
-            resultImage = queryResult.result;
-            info = "Success";
-            break;
-          }
-          if (queryResult.status === "error") {
-            errLog = queryResult.message || "Status is Error";
-            info = "API processing error";
-            break;
-          }
-
-          await sleep(POLL_INTERVAL_MS);
-        } catch (error) {
-          console.error("Poll error:", error);
-          errLog = error.message;
-          info = "Request timeout, please try again";
+        } else {
+          throw fetchError;
         }
       }
-
-      console.log("Get end time:", Date.now() - startTime);
-      console.log("Total time used:", Date.now() - startTime);
-
-      if (info === "") {
-        errLog = `No result after ${MAX_RETRIES} retries`;
-        info = "Request timeout, please try again";
-      }
-
-      if (info !== "Success") {
-        console.error("Error Log:", errLog);
-        res.status(500).json({
-          error: errLog,
-          image: null,
-          seed: usedSeed,
-          info,
-        });
-        return;
-      }
-
-      res.status(200).json({
-        image: resultImage,
-        seed: usedSeed,
-        info,
-      });
     } catch (processingError) {
       console.error("Processing error:", processingError);
       res.status(500).json({
+        status: "error",
         error: processingError.message,
-        image: null,
-        seed: usedSeed,
-        info: "Processing error occurred",
+        message: "Processing error occurred",
       });
     }
   } catch (error) {
     console.error("Unexpected error:", error);
     res.status(500).json({
+      status: "error",
       error: error.message,
-      image: null,
-      seed: 0,
-      info: "Unexpected error occurred",
+      message: "Unexpected error occurred",
     });
   }
 }
