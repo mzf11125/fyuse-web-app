@@ -306,7 +306,7 @@ export default async function tryonHandler(req, res) {
 
       // Create payload matching Kling API format
       const payload = {
-        model_name: "kolors-virtual-try-on-v1",
+        model_name: "kolors-virtual-try-on-v1-5",
         human_image: humanImageUrl,
         cloth_image: clothImageUrl,
       };
