@@ -1,8 +1,8 @@
 import formidable from "formidable";
 import fs from "node:fs";
 import jwt from "jsonwebtoken";
-import path from "node:path";
 import { v4 as uuidv4 } from "uuid";
+import { createClient } from "@supabase/supabase-js";
 
 // Constants for polling
 const POLL_INTERVAL_MS = 3000; // 3 seconds between checks
@@ -32,34 +32,99 @@ function generateToken(accessKeyId, accessKeySecret) {
   return jwt.sign(payload, accessKeySecret, { header: headers });
 }
 
-// Function to save image to public directory and return URL
-async function saveImageAndGetUrl(buffer, filename, req) {
-  // Define public directory path - adjust as needed for your Next.js setup
-  const publicDir = path.join(process.cwd(), "public", "uploads");
+// Function to upload image to Supabase storage and return public URL
+async function uploadToSupabaseAndGetUrl(buffer, filename) {
+  // Check for required environment variables
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-  // Create directory if it doesn't exist
-  if (!fs.existsSync(publicDir)) {
-    fs.mkdirSync(publicDir, { recursive: true });
+  if (!supabaseUrl || !supabaseServiceKey) {
+    throw new Error("Missing Supabase credentials in environment variables");
   }
 
-  // Generate unique filename
+  // Initialize Supabase client - creating it here ensures fresh client for each upload
+  const supabase = createClient(supabaseUrl, supabaseServiceKey);
+
+  // Create a unique filename
   const uniqueFilename = `${uuidv4()}-${filename}`;
-  const filePath = path.join(publicDir, uniqueFilename);
 
-  // Write file
-  await fs.promises.writeFile(filePath, buffer);
+  // Define the storage bucket
+  const bucketName = "tryon-images";
 
-  // Get base URL from request (works in both development and production)
-  const protocol = req.headers["x-forwarded-proto"] || "http";
-  const host = req.headers.host || "localhost:3000";
-  const baseUrl = `${protocol}://${host}`;
+  try {
+    // First check if bucket exists
+    const { data: buckets, error: listError } =
+      await supabase.storage.listBuckets();
 
-  // Return public URL
-  return `${baseUrl}/uploads/${uniqueFilename}`;
+    if (listError) {
+      console.error("Error listing buckets:", listError);
+      throw new Error(`Failed to list buckets: ${listError.message}`);
+    }
+
+    const bucketExists = buckets.some((bucket) => bucket.name === bucketName);
+
+    // Create bucket if it doesn't exist
+    if (!bucketExists) {
+      console.log(`Bucket ${bucketName} doesn't exist, creating...`);
+      const { error: createError } = await supabase.storage.createBucket(
+        bucketName,
+        {
+          public: true,
+          fileSizeLimit: 100 * 1024 * 1024, // 100MB limit
+        }
+      );
+
+      if (createError) {
+        console.error("Error creating bucket:", createError);
+        throw new Error(`Failed to create bucket: ${createError.message}`);
+      }
+      console.log(`Bucket ${bucketName} created successfully`);
+    }
+
+    // Determine content type
+    let contentType = "image/jpeg";
+    if (filename.toLowerCase().endsWith(".png")) contentType = "image/png";
+    if (filename.toLowerCase().endsWith(".gif")) contentType = "image/gif";
+    if (filename.toLowerCase().endsWith(".webp")) contentType = "image/webp";
+
+    console.log(`Uploading ${filename} to ${bucketName}/${uniqueFilename}`);
+
+    // Upload file to Supabase
+    const { data, error: uploadError } = await supabase.storage
+      .from(bucketName)
+      .upload(uniqueFilename, buffer, {
+        contentType,
+        upsert: false,
+      });
+
+    if (uploadError) {
+      console.error("Error uploading to Supabase:", uploadError);
+      throw new Error(`Error uploading to Supabase: ${uploadError.message}`);
+    }
+
+    console.log("Upload successful:", data);
+
+    // Get public URL for the uploaded file
+    const { data: publicUrlData } = supabase.storage
+      .from(bucketName)
+      .getPublicUrl(uniqueFilename);
+
+    if (!publicUrlData || !publicUrlData.publicUrl) {
+      throw new Error("Failed to get public URL for uploaded file");
+    }
+
+    console.log("Generated public URL:", publicUrlData.publicUrl);
+    return publicUrlData.publicUrl;
+  } catch (error) {
+    console.error("Supabase upload error:", error);
+    throw error;
+  }
 }
 
 // Function to validate image URL
 async function validateImageUrl(url) {
+  console.log("Validating URL:", url);
+
   try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
@@ -72,6 +137,12 @@ async function validateImageUrl(url) {
     clearTimeout(timeoutId);
 
     const contentType = response.headers.get("content-type");
+    console.log(
+      "URL validation - Content type:",
+      contentType,
+      "Status:",
+      response.status
+    );
 
     if (!contentType?.startsWith("image/")) {
       throw new Error(
@@ -86,6 +157,7 @@ async function validateImageUrl(url) {
 
     return true;
   } catch (error) {
+    console.error("URL validation error:", error);
     if (error.name === "AbortError") {
       throw new Error("Image URL validation timed out");
     }
@@ -103,6 +175,19 @@ export default async function tryonHandler(req, res) {
   console.log("Starting processing at:", startTime);
 
   try {
+    // Check for Supabase environment variables early
+    if (
+      !process.env.NEXT_PUBLIC_SUPABASE_URL ||
+      !process.env.SUPABASE_SERVICE_ROLE_KEY
+    ) {
+      res.status(500).json({
+        error: "Missing Supabase configuration",
+        status: "error",
+        message: "Supabase credentials not configured",
+      });
+      return;
+    }
+
     const form = formidable({
       multiples: true,
       keepExtensions: true,
@@ -110,7 +195,9 @@ export default async function tryonHandler(req, res) {
       maxFieldsSize: 100 * 1024 * 1024,
     });
 
+    console.log("Parsing form data...");
     const [fields, files] = await form.parse(req);
+    console.log("Form parsed, files received:", Object.keys(files));
 
     if (!files || !files.personImg || !files.garmentImg) {
       res.status(400).json({
@@ -128,8 +215,22 @@ export default async function tryonHandler(req, res) {
       ? files.garmentImg[0]
       : files.garmentImg;
 
+    console.log(
+      "Person image:",
+      personImgFile.originalFilename,
+      "size:",
+      personImgFile.size
+    );
+    console.log(
+      "Garment image:",
+      garmentImgFile.originalFilename,
+      "size:",
+      garmentImgFile.size
+    );
+
     try {
       // Read the image files into buffers
+      console.log("Reading image files...");
       const personImgBuffer = await fs.promises.readFile(
         personImgFile.filepath
       );
@@ -137,17 +238,23 @@ export default async function tryonHandler(req, res) {
         garmentImgFile.filepath
       );
 
-      // Save images and get public URLs
-      const humanImageUrl = await saveImageAndGetUrl(
-        personImgBuffer,
-        personImgFile.originalFilename || "person.jpg",
-        req
+      console.log(
+        "Image buffers created, person:",
+        personImgBuffer.length,
+        "garment:",
+        garmentImgBuffer.length
       );
 
-      const clothImageUrl = await saveImageAndGetUrl(
+      // Upload images to Supabase and get public URLs
+      console.log("Uploading to Supabase...");
+      const humanImageUrl = await uploadToSupabaseAndGetUrl(
+        personImgBuffer,
+        personImgFile.originalFilename || "person.jpg"
+      );
+
+      const clothImageUrl = await uploadToSupabaseAndGetUrl(
         garmentImgBuffer,
-        garmentImgFile.originalFilename || "garment.jpg",
-        req
+        garmentImgFile.originalFilename || "garment.jpg"
       );
 
       console.log("Human Image URL:", humanImageUrl);
@@ -155,16 +262,19 @@ export default async function tryonHandler(req, res) {
 
       // Validate image URLs
       try {
+        console.log("Validating image URLs...");
         await Promise.all([
           validateImageUrl(humanImageUrl),
           validateImageUrl(clothImageUrl),
         ]);
         console.log("Image URLs validated successfully");
       } catch (validationError) {
+        console.error("Validation error:", validationError);
         throw new Error(`Image validation failed: ${validationError.message}`);
       }
 
       // Clean up temporary files
+      console.log("Cleaning up temporary files...");
       await Promise.all([
         fs.promises.unlink(personImgFile.filepath),
         fs.promises.unlink(garmentImgFile.filepath),
