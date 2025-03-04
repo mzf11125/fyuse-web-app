@@ -80,7 +80,7 @@ export default function VirtualTryOn() {
       }
 
       const data = await response.json();
-      setResultImage(data.image);
+      setResultImage(data.generated_image_url);
       setSeedUsed(data.seed);
       setInfo(data.info);
       setActiveTab("result");
