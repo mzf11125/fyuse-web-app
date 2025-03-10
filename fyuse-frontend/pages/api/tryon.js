@@ -2,9 +2,12 @@ import formidable from "formidable";
 import fs from "node:fs";
 import jwt from "jsonwebtoken";
 import { v4 as uuidv4 } from "uuid";
-import { createClient } from "@supabase/supabase-js";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import {
+  BedrockRuntimeClient,
+  InvokeModelCommand,
+} from "@aws-sdk/client-bedrock-runtime";
 
-// Constants for polling
 const POLL_INTERVAL_MS = 3000; // 3 seconds between checks
 const MAX_WAIT_TIME_MS = 120000; // 2 minutes max wait
 
@@ -32,180 +35,249 @@ function generateToken(accessKeyId, accessKeySecret) {
   return jwt.sign(payload, accessKeySecret, { header: headers });
 }
 
-// Function to upload image to Supabase storage and return public URL
-async function uploadToSupabaseAndGetUrl(buffer, filename) {
-  // Check for required environment variables
-  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-  if (!supabaseUrl || !supabaseServiceKey) {
-    throw new Error("Missing Supabase credentials in environment variables");
-  }
-
-  // Initialize Supabase client - creating it here ensures fresh client for each upload
-  const supabase = createClient(supabaseUrl, supabaseServiceKey);
-
-  // Create a unique filename
+async function uploadToS3AndGetUrl(buffer, filename, folder) {
   const uniqueFilename = `${uuidv4()}-${filename}`;
+  const key = `${folder}/${uniqueFilename}`;
+  let contentType = "image/jpeg";
+  const lowerName = filename.toLowerCase();
+  if (lowerName.endsWith(".png")) contentType = "image/png";
+  else if (lowerName.endsWith(".gif")) contentType = "image/gif";
+  else if (lowerName.endsWith(".webp")) contentType = "image/webp";
 
-  // Define the storage bucket
-  const bucketName = "tryon-images";
+  const client = new S3Client({
+    region: process.env.AWS_REGION,
+    credentials: {
+      accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+    },
+  });
 
-  try {
-    // First check if bucket exists
-    const { data: buckets, error: listError } =
-      await supabase.storage.listBuckets();
+  const command = new PutObjectCommand({
+    Bucket: process.env.AWS_S3_BUCKET_NAME,
+    Key: key,
+    Body: buffer,
+    ContentType: contentType,
+  });
 
-    if (listError) {
-      console.error("Error listing buckets:", listError);
-      throw new Error(`Failed to list buckets: ${listError.message}`);
-    }
+  await client.send(command);
+  return `https://${process.env.AWS_S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
+}
 
-    const bucketExists = buckets.some((bucket) => bucket.name === bucketName);
+async function validateImageUrl(url) {
+  console.log("Validating URL:", url);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10000);
 
-    // Create bucket if it doesn't exist
-    if (!bucketExists) {
-      console.log(`Bucket ${bucketName} doesn't exist, creating...`);
-      const { error: createError } = await supabase.storage.createBucket(
-        bucketName,
-        {
-          public: true,
-          fileSizeLimit: 100 * 1024 * 1024, // 100MB limit
-        }
-      );
+  const response = await fetch(url, {
+    method: "HEAD",
+    signal: controller.signal,
+  });
+  clearTimeout(timeoutId);
 
-      if (createError) {
-        console.error("Error creating bucket:", createError);
-        throw new Error(`Failed to create bucket: ${createError.message}`);
-      }
-      console.log(`Bucket ${bucketName} created successfully`);
-    }
+  const contentType = response.headers.get("content-type") || "";
+  console.log(
+    "URL validation - Content type:",
+    contentType,
+    "Status:",
+    response.status
+  );
 
-    // Determine content type
-    let contentType = "image/jpeg";
-    if (filename.toLowerCase().endsWith(".png")) contentType = "image/png";
-    if (filename.toLowerCase().endsWith(".gif")) contentType = "image/gif";
-    if (filename.toLowerCase().endsWith(".webp")) contentType = "image/webp";
-
-    console.log(`Uploading ${filename} to ${bucketName}/${uniqueFilename}`);
-
-    // Upload file to Supabase
-    const { data, error: uploadError } = await supabase.storage
-      .from(bucketName)
-      .upload(uniqueFilename, buffer, {
-        contentType,
-        upsert: false,
-      });
-
-    if (uploadError) {
-      console.error("Error uploading to Supabase:", uploadError);
-      throw new Error(`Error uploading to Supabase: ${uploadError.message}`);
-    }
-
-    console.log("Upload successful:", data);
-
-    // Get public URL for the uploaded file
-    const { data: publicUrlData } = supabase.storage
-      .from(bucketName)
-      .getPublicUrl(uniqueFilename);
-
-    if (!publicUrlData || !publicUrlData.publicUrl) {
-      throw new Error("Failed to get public URL for uploaded file");
-    }
-
-    console.log("Generated public URL:", publicUrlData.publicUrl);
-    return publicUrlData.publicUrl;
-  } catch (error) {
-    console.error("Supabase upload error:", error);
-    throw error;
+  if (!contentType.startsWith("image/")) {
+    throw new Error(
+      `URL does not point to an image (content-type: ${contentType})`
+    );
+  }
+  if (!response.ok) {
+    throw new Error(`URL is not accessible (status code: ${response.status})`);
   }
 }
 
-// Function to validate image URL
-async function validateImageUrl(url) {
-  console.log("Validating URL:", url);
-
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
-
-    const response = await fetch(url, {
-      method: "HEAD",
-      signal: controller.signal,
-    });
-
-    clearTimeout(timeoutId);
-
-    const contentType = response.headers.get("content-type");
-    console.log(
-      "URL validation - Content type:",
-      contentType,
-      "Status:",
-      response.status
-    );
-
-    if (!contentType?.startsWith("image/")) {
-      throw new Error(
-        `URL does not point to an image (content-type: ${contentType})`
-      );
-    }
-    if (!response.ok) {
-      throw new Error(
-        `URL is not accessible (status code: ${response.status})`
-      );
-    }
-
-    return true;
-  } catch (error) {
-    console.error("URL validation error:", error);
-    if (error.name === "AbortError") {
-      throw new Error("Image URL validation timed out");
-    }
-    throw new Error(`Error accessing URL: ${error.message || "Unknown error"}`);
+// Updated streamToString: if not a stream or is a typed array, convert it to a string.
+function streamToString(stream) {
+  if (!stream) {
+    return Promise.resolve("");
   }
+  // If the stream is a Buffer or a typed array, convert it directly.
+  if (Buffer.isBuffer(stream) || stream instanceof Uint8Array) {
+    return Promise.resolve(Buffer.from(stream).toString("utf8"));
+  }
+  if (typeof stream === "string") {
+    return Promise.resolve(stream);
+  }
+  if (typeof stream.on !== "function") {
+    // If it's an ArrayBuffer, convert to Uint8Array and then to string.
+    if (stream instanceof ArrayBuffer) {
+      return Promise.resolve(
+        Buffer.from(new Uint8Array(stream)).toString("utf8")
+      );
+    }
+    return Promise.resolve(String(stream));
+  }
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    stream.on("data", (chunk) => chunks.push(chunk));
+    stream.on("error", reject);
+    stream.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+  });
+}
+
+// Function that downloads the image, determines its MIME type, and then calls Amazon Nova Lite for matching analysis.
+async function callMatchingAnalysis(imageUrl) {
+  console.log("Downloading composite image for matching analysis...");
+  const resp = await fetch(imageUrl);
+  if (!resp.ok) {
+    throw new Error(`Failed to fetch image: ${resp.statusText}`);
+  }
+
+  const contentType = resp.headers.get("content-type") || "image/jpeg";
+  console.log("Detected final image content type:", contentType);
+
+  let bedrockFormat = "jpeg";
+  if (contentType.includes("png")) bedrockFormat = "png";
+  else if (contentType.includes("gif")) bedrockFormat = "gif";
+  else if (contentType.includes("webp")) bedrockFormat = "webp";
+
+  const arrayBuffer = await resp.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  const base64Image = buffer.toString("base64");
+
+  // Updated prompts for concise matching analysis.
+  const systemPrompt = `
+You are a fashion expert specializing in analyzing how well clothing matches a person's body shape and skin tone from a single image.
+Your task is to:
+1. Identify the body shape (for men: Trapezoid, Triangle, Inverted Triangle, Rectangle, Round; for women: Rectangle, Inverted Triangle, Hourglass, Pear, Apple), skin tone (Fair, Light, Medium, Tan, Deep), top fit and color, and bottom fit and color.
+2. Provide a matching analysis that includes:
+   * Matching Percentage: [Percentage]%
+   * Matching Description: A concise description explaining how the outfit complements the individual's body shape and skin tone.
+Be concise and specific.
+  `;
+
+  const textPrompt = `
+Please analyze the generated try-on image and provide a matching analysis.
+Format your answer exactly as follows:
+Matching Percentage: [e.g., 90]%
+Matching Description: [A short description summarizing the analysis]
+  `;
+
+  const payload = {
+    schemaVersion: "messages-v1",
+    system: [{ text: systemPrompt }],
+    messages: [
+      {
+        role: "user",
+        content: [
+          {
+            image: {
+              format: bedrockFormat,
+              source: { bytes: base64Image },
+            },
+          },
+          { text: textPrompt },
+        ],
+      },
+    ],
+    inferenceConfig: {
+      maxTokens: 300,
+      temperature: 0.7,
+      topP: 0.9,
+      topK: 50,
+    },
+  };
+
+  const bedrockClient = new BedrockRuntimeClient({
+    region: "us-east-1", // Using the region where Nova Lite is available
+    credentials: {
+      accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+    },
+  });
+
+  const command = new InvokeModelCommand({
+    modelId: "us.amazon.nova-lite-v1:0",
+    body: JSON.stringify(payload),
+  });
+
+  console.log("Invoking Amazon Nova Lite for matching analysis...");
+  const bedrockResponse = await bedrockClient.send(command);
+  const raw = await streamToString(bedrockResponse.body);
+  console.log("Raw response from Bedrock:", raw);
+  const trimmed =
+    typeof raw === "string" ? raw.trim() : raw.toString("utf8").trim();
+
+  const firstBraceIndex = trimmed.indexOf("{");
+  const lastBraceIndex = trimmed.lastIndexOf("}");
+  if (
+    firstBraceIndex === -1 ||
+    lastBraceIndex === -1 ||
+    lastBraceIndex < firstBraceIndex
+  ) {
+    throw new Error(`No valid JSON object found in the response: ${trimmed}`);
+  }
+  const jsonString = trimmed.substring(firstBraceIndex, lastBraceIndex + 1);
+  console.log("Extracted JSON string:", jsonString);
+  const result = JSON.parse(jsonString);
+  return result.output.message.content[0].text;
 }
 
 export default async function tryonHandler(req, res) {
   if (req.method !== "POST") {
-    res.status(405).json({ error: "Method not allowed" });
-    return;
+    return res.status(405).json({ error: "Method not allowed" });
   }
 
+  // --- Matching Analysis Only Mode ---
+  if (req.query.action === "analyze") {
+    try {
+      let bodyStr = "";
+      for await (const chunk of req) {
+        bodyStr += chunk;
+      }
+      const { image_url } = JSON.parse(bodyStr);
+      if (!image_url) {
+        return res
+          .status(400)
+          .json({ error: "Missing image_url in request body" });
+      }
+      const analysis = await callMatchingAnalysis(image_url);
+      return res.status(200).json({ matching_analysis: analysis });
+    } catch (err) {
+      console.error("Error during matching analysis:", err);
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // --- Try-On Generation Mode ---
   const startTime = Date.now();
   console.log("Starting processing at:", startTime);
 
   try {
-    // Check for Supabase environment variables early
     if (
-      !process.env.NEXT_PUBLIC_SUPABASE_URL ||
-      !process.env.SUPABASE_SERVICE_ROLE_KEY
+      !process.env.AWS_ACCESS_KEY_ID ||
+      !process.env.AWS_SECRET_ACCESS_KEY ||
+      !process.env.KOLORS_ACCESS_KEY_ID ||
+      !process.env.KOLORS_ACCESS_KEY_SECRET
     ) {
-      res.status(500).json({
-        error: "Missing Supabase configuration",
+      return res.status(500).json({
+        error: "Missing S3 Bucket or Kling credentials",
         status: "error",
-        message: "Supabase credentials not configured",
+        message: "Check environment variables for AWS + Kling credentials",
       });
-      return;
     }
 
-    const form = formidable({
-      multiples: true,
-      keepExtensions: true,
-      maxFileSize: 100 * 1024 * 1024,
-      maxFieldsSize: 100 * 1024 * 1024,
+    const form = formidable({ multiples: true, keepExtensions: true });
+    const { fields, files } = await new Promise((resolve, reject) => {
+      form.parse(req, (err, fields, files) => {
+        if (err) reject(err);
+        else resolve({ fields, files });
+      });
     });
 
-    console.log("Parsing form data...");
-    const [fields, files] = await form.parse(req);
     console.log("Form parsed, files received:", Object.keys(files));
-
-    if (!files || !files.personImg || !files.garmentImg) {
-      res.status(400).json({
+    if (!files.personImg || !files.garmentImg) {
+      return res.status(400).json({
         error: "Empty image",
         status: "error",
         message: "Both person and garment images are required",
       });
-      return;
     }
 
     const personImgFile = Array.isArray(files.personImg)
@@ -228,234 +300,175 @@ export default async function tryonHandler(req, res) {
       garmentImgFile.size
     );
 
+    const personImgBuffer = await fs.promises.readFile(personImgFile.filepath);
+    const garmentImgBuffer = await fs.promises.readFile(
+      garmentImgFile.filepath
+    );
+
+    const humanImageUrl = await uploadToS3AndGetUrl(
+      personImgBuffer,
+      personImgFile.originalFilename || "person.jpg",
+      "uploaded-image/user-image"
+    );
+    const clothImageUrl = await uploadToS3AndGetUrl(
+      garmentImgBuffer,
+      garmentImgFile.originalFilename || "garment.jpg",
+      "uploaded-image/apparel-image"
+    );
+    console.log("Human Image URL:", humanImageUrl);
+    console.log("Cloth Image URL:", clothImageUrl);
+
+    await Promise.all([
+      validateImageUrl(humanImageUrl),
+      validateImageUrl(clothImageUrl),
+    ]);
+
     try {
-      // Read the image files into buffers
-      console.log("Reading image files...");
-      const personImgBuffer = await fs.promises.readFile(
-        personImgFile.filepath
-      );
-      const garmentImgBuffer = await fs.promises.readFile(
-        garmentImgFile.filepath
-      );
+      await fs.promises.unlink(personImgFile.filepath);
+      await fs.promises.unlink(garmentImgFile.filepath);
+    } catch (err) {
+      console.warn("File cleanup failed:", err);
+    }
 
-      console.log(
-        "Image buffers created, person:",
-        personImgBuffer.length,
-        "garment:",
-        garmentImgBuffer.length
-      );
-
-      // Upload images to Supabase and get public URLs
-      console.log("Uploading to Supabase...");
-      const humanImageUrl = await uploadToSupabaseAndGetUrl(
-        personImgBuffer,
-        personImgFile.originalFilename || "person.jpg"
-      );
-
-      const clothImageUrl = await uploadToSupabaseAndGetUrl(
-        garmentImgBuffer,
-        garmentImgFile.originalFilename || "garment.jpg"
-      );
-
-      console.log("Human Image URL:", humanImageUrl);
-      console.log("Cloth Image URL:", clothImageUrl);
-
-      // Validate image URLs
-      try {
-        console.log("Validating image URLs...");
-        await Promise.all([
-          validateImageUrl(humanImageUrl),
-          validateImageUrl(clothImageUrl),
-        ]);
-        console.log("Image URLs validated successfully");
-      } catch (validationError) {
-        console.error("Validation error:", validationError);
-        throw new Error(`Image validation failed: ${validationError.message}`);
-      }
-
-      // Clean up temporary files
-      console.log("Cleaning up temporary files...");
-      await Promise.all([
-        fs.promises.unlink(personImgFile.filepath),
-        fs.promises.unlink(garmentImgFile.filepath),
-      ]);
-
-      // Get API credentials from environment
-      const API_BASE_URL = process.env.KOLORS_API_URL;
-      const accessKeyId = process.env.ACCESS_KEY_ID;
-      const accessKeySecret = process.env.ACCESS_KEY_SECRET;
-
-      if (!API_BASE_URL || !accessKeyId || !accessKeySecret) {
-        res.status(500).json({
-          error: "Missing API configuration",
-          status: "error",
-          message: "API credentials not configured",
-        });
-        return;
-      }
-
-      console.log("Using API URL:", API_BASE_URL);
-
-      // Generate JWT token using credentials
-      const token = generateToken(accessKeyId, accessKeySecret);
-
-      const headers = {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      };
-
-      // Create payload matching Kling API format
-      const payload = {
-        model_name: "kolors-virtual-try-on-v1-5",
-        human_image: humanImageUrl,
-        cloth_image: clothImageUrl,
-      };
-
-      console.log("Creating task with payload:", JSON.stringify(payload));
-      console.log("Task creation start time:", Date.now() - startTime);
-
-      // Create task with timeout handling
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
-
-      try {
-        const postResponse = await fetch(API_BASE_URL, {
-          method: "POST",
-          headers,
-          body: JSON.stringify(payload),
-          signal: controller.signal,
-        });
-
-        clearTimeout(timeoutId);
-        console.log("Task creation response status:", postResponse.status);
-        console.log("Task creation end time:", Date.now() - startTime);
-
-        if (!postResponse.ok) {
-          const errorText = await postResponse.text();
-          console.error("API error response:", errorText);
-          throw new Error(
-            `API error: ${postResponse.status} ${postResponse.statusText}`
-          );
-        }
-
-        const postData = await postResponse.json();
-        console.log("Task creation response:", JSON.stringify(postData));
-
-        if (postData.code !== 0) {
-          throw new Error(`API Error: ${postData.message}`);
-        }
-
-        const taskId = postData.data.task_id;
-        console.log("Task created with ID:", taskId);
-
-        // Wait for task completion
-        const startWaitTime = Date.now();
-        let resultImageUrl = null;
-
-        while (Date.now() - startWaitTime < MAX_WAIT_TIME_MS) {
-          try {
-            console.log(
-              `Polling task status... (${Math.round(
-                (Date.now() - startWaitTime) / 1000
-              )}s elapsed)`
-            );
-
-            const queryController = new AbortController();
-            const queryTimeoutId = setTimeout(
-              () => queryController.abort(),
-              10000
-            );
-
-            const queryResponse = await fetch(`${API_BASE_URL}/${taskId}`, {
-              headers,
-              signal: queryController.signal,
-            });
-
-            clearTimeout(queryTimeoutId);
-
-            if (!queryResponse.ok) {
-              throw new Error(
-                `API request failed: ${queryResponse.status} ${queryResponse.statusText}`
-              );
-            }
-
-            const queryData = await queryResponse.json();
-            console.log("Poll response:", JSON.stringify(queryData));
-
-            if (queryData.code !== 0) {
-              throw new Error(`API Error: ${queryData.message}`);
-            }
-
-            const status = queryData.data.task_status;
-
-            if (status === "succeed") {
-              // Extract result image URL
-              resultImageUrl = queryData.data.task_result?.images[0]?.url;
-              console.log(
-                "Task completed successfully with result:",
-                resultImageUrl
-              );
-              break;
-            }
-            if (status === "failed") {
-              throw new Error(
-                `Task failed: ${
-                  queryData.data.task_status_msg || "Unknown error"
-                }`
-              );
-            }
-
-            // If still processing, wait before next check
-            await sleep(POLL_INTERVAL_MS);
-          } catch (pollError) {
-            if (pollError.name === "AbortError") {
-              console.log("Poll request timed out, trying again...");
-              continue;
-            }
-            throw pollError;
-          }
-        }
-
-        console.log("Polling end time:", Date.now() - startTime);
-        console.log("Total time used:", Date.now() - startTime);
-
-        if (!resultImageUrl) {
-          throw new Error(
-            `Task ${taskId} timed out after ${MAX_WAIT_TIME_MS / 1000} seconds`
-          );
-        }
-
-        // Return success response with image URL
-        res.status(200).json({
-          status: "success",
-          task_id: taskId,
-          generated_image_url: resultImageUrl,
-        });
-      } catch (fetchError) {
-        if (fetchError.name === "AbortError") {
-          res.status(504).json({
-            status: "error",
-            error: "API request timed out",
-            message: "Request timeout, please try again",
-          });
-        } else {
-          throw fetchError;
-        }
-      }
-    } catch (processingError) {
-      console.error("Processing error:", processingError);
-      res.status(500).json({
+    const API_BASE_URL = process.env.KOLORS_API_URL;
+    if (!API_BASE_URL) {
+      return res.status(500).json({
+        error: "Missing API configuration",
         status: "error",
-        error: processingError.message,
-        message: "Processing error occurred",
+        message: "API credentials not configured",
       });
     }
+    console.log("Using API URL:", API_BASE_URL);
+
+    const token = generateToken(
+      process.env.KOLORS_ACCESS_KEY_ID,
+      process.env.KOLORS_ACCESS_KEY_SECRET
+    );
+    const headers = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    };
+
+    const payload = {
+      model_name: "kolors-virtual-try-on-v1-5",
+      human_image: humanImageUrl,
+      cloth_image: clothImageUrl,
+    };
+
+    console.log("Creating Kling task with payload:", JSON.stringify(payload));
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
+
+    const postResponse = await fetch(API_BASE_URL, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    if (!postResponse.ok) {
+      const errorText = await postResponse.text();
+      console.error("Kling API error response:", errorText);
+      throw new Error(
+        `Kling API error: ${postResponse.status} ${postResponse.statusText}`
+      );
+    }
+
+    const postData = await postResponse.json();
+    if (postData.code !== 0) {
+      throw new Error(`Kling API Error: ${postData.message}`);
+    }
+
+    const taskId = postData.data.task_id;
+    console.log("Task created with ID:", taskId);
+
+    const startWaitTime = Date.now();
+    let resultImageUrl = null;
+    while (Date.now() - startWaitTime < MAX_WAIT_TIME_MS) {
+      console.log(
+        `Polling task status... (${Math.round(
+          (Date.now() - startWaitTime) / 1000
+        )}s elapsed)`
+      );
+      const queryController = new AbortController();
+      const queryTimeoutId = setTimeout(() => queryController.abort(), 10000);
+
+      const queryResponse = await fetch(`${API_BASE_URL}/${taskId}`, {
+        headers,
+        signal: queryController.signal,
+      });
+      clearTimeout(queryTimeoutId);
+
+      if (!queryResponse.ok) {
+        throw new Error(
+          `Kling API request failed: ${queryResponse.status} ${queryResponse.statusText}`
+        );
+      }
+
+      const queryData = await queryResponse.json();
+      if (queryData.code !== 0) {
+        throw new Error(`Kling API Error: ${queryData.message}`);
+      }
+
+      const status = queryData.data.task_status;
+      if (status === "succeed") {
+        resultImageUrl = queryData.data.task_result?.images?.[0]?.url;
+        console.log("Task completed successfully with result:", resultImageUrl);
+        if (resultImageUrl) {
+          try {
+            const finalResp = await fetch(resultImageUrl);
+            if (!finalResp.ok) {
+              throw new Error(
+                `Failed to fetch generated image: ${finalResp.statusText}`
+              );
+            }
+            const finalContentType =
+              finalResp.headers.get("content-type") || "image/jpeg";
+            let extension = "jpeg";
+            if (finalContentType.includes("png")) extension = "png";
+            else if (finalContentType.includes("gif")) extension = "gif";
+            else if (finalContentType.includes("webp")) extension = "webp";
+
+            const arrayBuffer = await finalResp.arrayBuffer();
+            const imageBuffer = Buffer.from(arrayBuffer);
+            const generatedImageName = `generated-${uuidv4()}.${extension}`;
+            const finalUrl = await uploadToS3AndGetUrl(
+              imageBuffer,
+              generatedImageName,
+              "generated-image"
+            );
+            console.log("Generated image uploaded successfully:", finalUrl);
+            resultImageUrl = finalUrl;
+          } catch (err) {
+            console.error("Error fetching or uploading generated image:", err);
+          }
+        }
+        break;
+      }
+      if (status === "failed") {
+        const msg = queryData.data.task_status_msg || "Unknown error";
+        throw new Error(`Task failed: ${msg}`);
+      }
+      await sleep(POLL_INTERVAL_MS);
+    }
+
+    if (!resultImageUrl) {
+      throw new Error("Image generation took too long or never succeeded.");
+    }
+
+    // Return only the generated image URL and task ID.
+    return res.status(200).json({
+      status: "success",
+      task_id: taskId,
+      generated_image_url: resultImageUrl,
+    });
   } catch (error) {
-    console.error("Unexpected error:", error);
-    res.status(500).json({
+    console.error("Processing error:", error);
+    return res.status(500).json({
       status: "error",
       error: error.message,
-      message: "Unexpected error occurred",
+      message: "Processing error occurred",
     });
   }
 }
